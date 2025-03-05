@@ -1,49 +1,29 @@
-cmake_minimum_required(VERSION 3.16)
-project(example)
+cmake_minimum_required(VERSION 3.10)
+project(CurveDeformer)
 
-list(PREPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Libigl
-include(libigl)
+# Find OpenCV package
+find_package(OpenCV REQUIRED)
 
-# Enable the target igl::glfw
-igl_include(glfw)
-# Other modules you could enable
-#igl_include(embree)
-#igl_include(imgui)
-#igl_include(opengl)
-#igl_include(stb)
-#igl_include(predicates)
-#igl_include(xml)
-#igl_include(copyleft cgal)
-#igl_include(copyleft comiso)
-#igl_include(copyleft core)
-#igl_include(copyleft cork)
-#igl_include(copyleft tetgen)
-#igl_include(restricted matlab)
-#igl_include(restricted mosek)
-#igl_include(restricted triangle)
+# Manually specify Eigen include directory (Homebrew installation path)
+set(EIGEN3_INCLUDE_DIR "/opt/homebrew/Cellar/eigen/3.4.0_1/include/eigen3")
+if(NOT EXISTS ${EIGEN3_INCLUDE_DIR})
+    message(FATAL_ERROR "Eigen not found! Please install Eigen or specify the correct path.")
+endif()
 
-# Add your project files
-file(GLOB SRC_FILES *.cpp)
-add_executable(${PROJECT_NAME} ${SRC_FILES})
+# Include directories
+include_directories(${OpenCV_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
 
-# Link igl (and the glfw module) to your project
-target_link_libraries(${PROJECT_NAME} PUBLIC 
-  igl::glfw
-  ## Other modules you could link to
-  # igl::embree
-  # igl::imgui
-  # igl::opengl
-  # igl::stb
-  # igl::predicates
-  # igl::xml
-  # igl_copyleft::cgal
-  # igl_copyleft::comiso
-  # igl_copyleft::core
-  # igl_copyleft::cork
-  # igl_copyleft::tetgen
-  # igl_restricted::matlab
-  # igl_restricted::mosek
-  # igl_restricted::triangle
-  )
+# Add executable
+add_executable(CurveDeformer main.cpp)
+
+# Link OpenCV libraries
+target_link_libraries(CurveDeformer ${OpenCV_LIBRARIES})
+
+# Optional: Print found libraries for debugging
+message(STATUS "OpenCV libraries: ${OpenCV_LIBRARIES}")
+message(STATUS "Eigen include dir: ${EIGEN3_INCLUDE_DIR}")
+SET(CMAKE_BUILD_TYPE "RelWithDebInfo")
