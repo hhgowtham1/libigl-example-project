@@ -1,299 +1,431 @@
 #include <opencv2/opencv.hpp>
-#include <vector>
-#include <fstream>
+#include <Eigen/Dense>
 #include <Eigen/Sparse>
+#include <vector>
+#include <iostream>
+#include <cmath>
+#include <fstream>
 
 using namespace cv;
 using namespace std;
 
-// Data structures
-struct CurveData {
-    Point2d p0, p1;
-    vector<Point2d> sampledLine;
-    vector<Point2d> strokePoints;
-    vector<double> zDistances;
-    vector<Point3d> deformedCurve3D;
-};
-
-struct Intersection {
-    int curveIndex;
-    int pointIndex;
-    Point2d position;
-};
-
-// Global state
-vector<CurveData> curves;
-vector<Intersection> currentIntersections;
-Point2d p0, p1;
-vector<Point2d> currentStroke;
-enum State { SET_P0, SET_P1, DRAW_STROKE };
+// ---------------------------
+// Global State and Data Structures
+// ---------------------------
+enum State { SET_P0, SET_P1, WAIT_STROKE, DRAW_STROKE };
 State currentState = SET_P0;
 
-// Utility functions
-Point2d cv2gl(const Point2d& p) { return Point2d(p.x, -p.y + 480); }
-Point2d gl2cv(const Point2d& p) { return Point2d(p.x, -p.y + 480); }
+Point2d p0, p1;                    // Endpoints for the line segment
+vector<Point2d> currentStroke;     // Freehand stroke points
+vector<Point2d> sampledLine;       // Uniformly sampled points from p0 to p1
+vector<double> currentzDistances;         // Distances for deformation
+vector<vector<double>>allzDistances;
+vector<pair<Point2d, Point2d>> lineSegments;  // Stores all drawn line segments
+vector<Point2d> intersections;               // Stores intersection points
+vector<vector<Point2d>> sampledLines;
+pair<int,int> intersectionPair;
+// ---------------------------
+// Utility Functions
+// ---------------------------
 
-vector<Point2d> sampleLine(const Point2d& start, const Point2d& end, int n) {
-    vector<Point2d> points;
-    for(int i = 0; i < n; ++i) {
-        double t = static_cast<double>(i)/(n-1);
-        points.emplace_back(start.x*(1-t) + end.x*t,
-                           start.y*(1-t) + end.y*t);
+// ARAP Deformation for a 1D curve (chain) in 3D using Eigen.
+// X0: initial 3D curve as an (n x 3) matrix (each row is a point)
+// base: the reference (rest) shape (n x 3) – typically the same as X0
+// constraints: indices of vertices that are fixed (e.g., {0, intersectionIndex, n-1})
+// targetPositions: a (c x 3) matrix with the target positions for the fixed vertices
+// maxIter: maximum iterations (not fully iterated in this simple version)
+// tol: convergence tolerance (not used in this one-shot solve version)
+Eigen::MatrixXd deformCurveARAP(const Eigen::MatrixXd &X0,
+                                const Eigen::MatrixXd &base,
+                                const std::vector<int> &constraints,
+                                const Eigen::MatrixXd &targetPositions,
+                                int maxIter = 10,
+                                double tol = 1e-4) {
+    int n = X0.rows();
+    Eigen::MatrixXd X = X0; // Current deformed positions
+
+    // Build the Laplacian matrix L for a chain (n x n)
+    Eigen::SparseMatrix<double> L(n, n);
+    std::vector<Eigen::Triplet<double>> triplets;
+    if(n > 0) {
+        triplets.push_back(Eigen::Triplet<double>(0, 0, 1));
+        if(n > 1)
+            triplets.push_back(Eigen::Triplet<double>(0, 1, -1));
     }
-    return points;
+    for(int i = 1; i < n - 1; i++){
+        triplets.push_back(Eigen::Triplet<double>(i, i-1, -1));
+        triplets.push_back(Eigen::Triplet<double>(i, i, 2));
+        triplets.push_back(Eigen::Triplet<double>(i, i+1, -1));
+    }
+    if(n > 1) {
+        int i = n - 1;
+        triplets.push_back(Eigen::Triplet<double>(i, i-1, -1));
+        triplets.push_back(Eigen::Triplet<double>(i, i, 1));
+    }
+    L.setFromTriplets(triplets.begin(), triplets.end());
+
+    // Build the constraint matrix C (c x n) where c = constraints.size()
+    int c = constraints.size();
+    Eigen::SparseMatrix<double> C(c, n);
+    std::vector<Eigen::Triplet<double>> tripC;
+    for (int i = 0; i < c; i++){
+        int idx = constraints[i];
+        tripC.push_back(Eigen::Triplet<double>(i, idx, 1));
+    }
+    C.setFromTriplets(tripC.begin(), tripC.end());
+
+    // Weight for constraints
+    double lambda = 1e6;
+    int m = n + c; // Total rows in augmented system
+
+    // Build the augmented matrix A = [L; sqrt(lambda)*C]
+    Eigen::SparseMatrix<double> A(m, n);
+    std::vector<Eigen::Triplet<double>> tripA;
+    for (int k = 0; k < L.outerSize(); k++){
+        for (Eigen::SparseMatrix<double>::InnerIterator it(L, k); it; ++it){
+            tripA.push_back(Eigen::Triplet<double>(it.row(), it.col(), it.value()));
+        }
+    }
+    for (int k = 0; k < C.outerSize(); k++){
+        for (Eigen::SparseMatrix<double>::InnerIterator it(C, k); it; ++it){
+            tripA.push_back(Eigen::Triplet<double>(L.rows() + it.row(), it.col(), std::sqrt(lambda) * it.value()));
+        }
+    }
+    A.setFromTriplets(tripA.begin(), tripA.end());
+
+    // Construct the right-hand side b.
+    // Here, we use the Laplacian applied to the base as a simple divergence vector.
+    // In a full ARAP, you would compute per-edge rotations and then build b accordingly.
+    Eigen::MatrixXd b = L * base;
+    // Augment b with the constraints.
+    Eigen::MatrixXd b_aug(m, 3);
+    b_aug.topRows(n) = b;
+    b_aug.bottomRows(c) = std::sqrt(lambda) * targetPositions;
+
+    // Solve the normal equations: (A^T A) X = A^T b_aug.
+    Eigen::SparseMatrix<double> AtA = A.transpose() * A;
+    Eigen::MatrixXd Atb = A.transpose() * b_aug;
+    Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver;
+    solver.compute(AtA);
+    if(solver.info() != Eigen::Success) {
+        std::cerr << "Decomposition failed in ARAP." << std::endl;
+        return X;
+    }
+    X = solver.solve(Atb);
+    if(solver.info() != Eigen::Success) {
+        std::cerr << "Solving failed in ARAP." << std::endl;
+        return X;
+    }
+    return X;
 }
 
-bool segmentIntersection(const Point2d& a1, const Point2d& a2,
-                        const Point2d& b1, const Point2d& b2,
-                        Point2d& intersection) {
-    Point2d da = a2 - a1;
-    Point2d db = b2 - b1;
-    Point2d ab = b1 - a1;
+Eigen::MatrixXd vectorToMat(const vector<Point3d>& pts) {
+    int n = pts.size();
+    Eigen::MatrixXd M(n, 3);
+    for (int i = 0; i < n; i++) {
+        M(i, 0) = pts[i].x;
+        M(i, 1) = pts[i].y;
+        M(i, 2) = pts[i].z;
+    }
+    return M;
+}
 
-    double cross = da.x*db.y - da.y*db.x;
-    if(abs(cross) < 1e-7) return false;
+vector<Point3d> matToVector(const Eigen::MatrixXd &M) {
+    int n = M.rows();
+    vector<Point3d> pts;
+    for (int i = 0; i < n; i++) {
+        pts.push_back(Point3d(M(i,0), M(i,1), M(i,2)));
+    }
+    return pts;
+}
 
-    double t = (ab.x*db.y - ab.y*db.x)/cross;
-    double u = (ab.x*da.y - ab.y*da.x)/cross;
-    
-    if(t >= 0 && t <= 1 && u >= 0 && u <= 1) {
-        intersection = a1 + t*da;
+
+void exportToOBJ(const vector<Point3d>& curve, const string& filename) {
+    ofstream file(filename);
+
+    int vertexOffset = 1;
+    // for (const auto& curve : curves)
+    {
+        // Write vertices
+        for (const auto& p : curve) {
+            file << "v " << p.x << " " << p.y << " " << p.z << "\n";
+        }
+
+        // Write line (connectivity)
+
+        for (size_t i = 1; i < curve.size(); ++i) {
+            file << "l " <<i<<" "<< vertexOffset + i << "\n";
+        }
+
+    }
+}
+
+// Uniformly sample a line with 'n' points
+vector<Point2d> sampleLine2D(const Point2d& start, const Point2d& end, int n) {
+    vector<Point2d> pts;
+    for (int i = 0; i < n; i++) {
+        double t = double(i) / (n - 1);
+        pts.push_back(Point2d(start.x * (1 - t) + end.x * t,
+                              start.y * (1 - t) + end.y * t));
+    }
+    return pts;
+}
+
+// Convert vector<Point2d> to vector<Point> (for OpenCV drawing)
+vector<Point> convertToIntPoints(const vector<Point2d>& pts) {
+    vector<Point> ret;
+    for (const auto& p : pts)
+        ret.push_back(Point(cvRound(p.x), cvRound(p.y)));
+    return ret;
+}
+
+// Compute Euclidean distance between two points
+double distance2D(const Point2d& a, const Point2d& b) {
+    return sqrt(pow(a.x - b.x, 2) + pow(a.y - b.y, 2));
+}
+
+// ---------------------------
+// Line Intersection Helper
+// ---------------------------
+
+// Check if two line segments (A-B and C-D) intersect
+bool lineSegmentIntersection(Point2d A, Point2d B, Point2d C, Point2d D, Point2d& intersection) {
+    // Solve for intersection using determinant approach
+    double denom = (A.x - B.x) * (C.y - D.y) - (A.y - B.y) * (C.x - D.x);
+    if (denom == 0) return false; // Parallel lines
+
+    double t = ((A.x - C.x) * (C.y - D.y) - (A.y - C.y) * (C.x - D.x)) / denom;
+    double u = ((A.x - C.x) * (A.y - B.y) - (A.y - C.y) * (A.x - B.x)) / denom;
+
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+        intersection.x = A.x + t * (B.x - A.x);
+        intersection.y = A.y + t * (B.y - A.y);
         return true;
     }
     return false;
 }
 
-// ARAP Deformation
-vector<Point3d> deformARAP(const vector<Point3d>& curve,
-                          const vector<pair<int, Point3d>>& constraints) {
-    const int n = curve.size();
-    typedef Eigen::Triplet<double> T;
-    
-    // Build Laplace matrix
-    Eigen::SparseMatrix<double> L(n, n);
-    vector<T> coefficients;
-    for(int i = 1; i < n-1; ++i) {
-        coefficients.emplace_back(i, i-1, -1);
-        coefficients.emplace_back(i, i, 2);
-        coefficients.emplace_back(i, i+1, -1);
-    }
-    L.setFromTriplets(coefficients.begin(), coefficients.end());
-    
-    // Build constraint matrix
-    Eigen::SparseMatrix<double> C(constraints.size(), n);
-    Eigen::VectorXd d(constraints.size());
-    for(size_t i = 0; i < constraints.size(); ++i) {
-        C.insert(i, constraints[i].first) = 1;
-        d[i] = constraints[i].second.z;
-    }
-    
-    // Solve (L^T L + λ C^T C) x = L^T L x0 + λ C^T d
-    const double lambda = 1e6;
-    Eigen::SparseMatrix<double> A = L.transpose() * L + lambda * C.transpose() * C;
-    Eigen::VectorXd b = L.transpose() * L * Eigen::Map<const Eigen::VectorXd>(&curve[0].x, n*3)
-                      + lambda * C.transpose() * d;
-    
-    Eigen::ConjugateGradient<Eigen::SparseMatrix<double>> solver;
-    solver.compute(A);
-    Eigen::VectorXd x = solver.solve(b);
-    
-    // Reconstruct deformed curve
-    vector<Point3d> deformed;
-    for(int i = 0; i < n; ++i) {
-        deformed.emplace_back(x[3*i], x[3*i+1], curve[i].z);
-    }
-    return deformed;
-}
+// ---------------------------
+// Redraw function – draws current state
+// ---------------------------
 void redraw() {
     Mat display(480, 640, CV_8UC3, Scalar(255,255,255));
-    
-    // Draw existing curves
-    for(const auto& curve : curves) {
-        line(display, cv2gl(curve.p0), cv2gl(curve.p1), Scalar(255,0,0), 2);
+
+    // Draw existing line segments
+    for (const auto& segment : lineSegments) {
+        line(display, segment.first, segment.second, Scalar(255,0,0), 2);
     }
-    
-    // Draw current line segment
-    if(currentState == SET_P1 || currentState == DRAW_STROKE) {
-        line(display, cv2gl(p0), cv2gl(p1), Scalar(0,255,0), 2);
+
+    // Draw current line segment if endpoints are set
+    if (currentState == SET_P1 || currentState == WAIT_STROKE || currentState == DRAW_STROKE) {
+        line(display, p0, p1, Scalar(0,255,0), 2);
+        circle(display, p0, 3, Scalar(0,255,0), -1);
+        circle(display, p1, 3, Scalar(0,255,0), -1);
     }
-    
+
+    // Draw current stroke
+    if (!currentStroke.empty()) {
+        polylines(display, convertToIntPoints(currentStroke), false, Scalar(0,255,0), 1, LINE_AA);
+    }
+
+    // Draw red lines connecting sampled points and stroke points
+    if (!sampledLine.empty() && sampledLine.size() == currentStroke.size()) {
+        vector<Point> samplePts = convertToIntPoints(sampledLine);
+        vector<Point> strokePts = convertToIntPoints(currentStroke);
+        for (size_t i = 0; i < samplePts.size(); i++) {
+            line(display, samplePts[i], strokePts[i], Scalar(0,0,255), 1);
+        }
+    }
+
+    // Draw intersection points in RED
+    for (const auto& pt : intersections) {
+        circle(display, pt, 5, Scalar(0,0,255), -1);
+    }
+
     imshow("Curve Deformation", display);
 }
-// OBJ Export
-void exportToOBJ(const vector<CurveData>& curves, const string& filename) {
-    ofstream file(filename);
-    int vertexOffset = 1;
-    
-    for(const auto& curve : curves) {
-        // Write vertices
-        for(const auto& p : curve.deformedCurve3D) {
-            file << "v " << p.x << " " << p.y << " " << p.z << "\n";
-        }
-        
-        // Write line
-        file << "l";
-        for(size_t i = 0; i < curve.deformedCurve3D.size(); ++i) {
-            file << " " << vertexOffset + i;
-        }
-        file << "\n";
-        
-        vertexOffset += curve.deformedCurve3D.size();
+
+// ---------------------------
+// Mouse Callback – Implements the state machine
+// ---------------------------
+void mouseCallback(int event, int x, int y, int flags, void*) {
+    Point2d pos(x, y);
+
+    if (currentState == SET_P0 && event == EVENT_LBUTTONDOWN) {
+        p0 = pos;
+        cout << "p0 set to " << p0 << endl;
+        currentState = SET_P1;
     }
+    else if (currentState == SET_P1 && event == EVENT_LBUTTONDOWN) {
+        p1 = pos;
+        cout << "p1 set to " << p1 << endl;
+        currentState = WAIT_STROKE;
+        lineSegments.push_back({p0, p1}); // Store the line segment
+        cout << "Press 'S' to start drawing stroke." << endl;
+    }
+    else if (currentState == DRAW_STROKE) {
+        if (event == EVENT_MOUSEMOVE && (flags & EVENT_FLAG_LBUTTON)) {
+            currentStroke.push_back(pos);
+        }
+    }
+
+    redraw();
 }
 
-// Mouse callback
-void mouseCallback(int event, int x, int y, int flags, void* userdata) {
-    Point2d p(x, y);
-    cout << "Mouse event: " << event << " at (" << x << "," << y << ")" << endl;
-        cout << "Current state: " << currentState << endl;
-    switch(currentState) {
-        case SET_P0:
-            if(event == EVENT_LBUTTONDOWN) {
-                p0 = gl2cv(p);
-                currentState = SET_P1;
-                cout << "Set p0 to " << p0 << endl;
-                redraw();
-            }
-            break;
-            
-        case SET_P1:
-            if(event == EVENT_LBUTTONDOWN) {
-                p1 = gl2cv(p);
-                currentState = DRAW_STROKE;
-                cout << "Set p1 to " << p1 << endl;
-                redraw();
-            }
-            break;
-            
-        case DRAW_STROKE:
-            if(event == EVENT_MOUSEMOVE && (flags & EVENT_FLAG_LBUTTON)) {
-                currentStroke.push_back(gl2cv(p));
-                redraw();
-            }
-            else if(event == EVENT_LBUTTONUP) {
-                // Process new curve
-                CurveData newCurve;
-                newCurve.p0 = p0;
-                newCurve.p1 = p1;
-                newCurve.sampledLine = sampleLine(p0, p1, currentStroke.size());
-                newCurve.strokePoints = currentStroke;
-                
-                // Calculate z distances
-                for(size_t i = 0; i < newCurve.sampledLine.size(); ++i) {
-                    double dx = newCurve.strokePoints[i].x - newCurve.sampledLine[i].x;
-                    double dy = newCurve.strokePoints[i].y - newCurve.sampledLine[i].y;
-                    newCurve.zDistances.push_back(sqrt(dx*dx + dy*dy));
-                }
-                
-                // Create initial 3D curve (x,y from sampled line, z from distances)
-                vector<Point3d> initial3D;
-                for(size_t i = 0; i < newCurve.sampledLine.size(); ++i) {
-                    initial3D.emplace_back(
-                        newCurve.sampledLine[i].x,
-                        newCurve.sampledLine[i].y,
-                        newCurve.zDistances[i]
-                    );
-                }
-                
-                // Check intersections with existing curves
-                vector<pair<int, Point3d>> constraints;
-                constraints.emplace_back(0, initial3D.front());
-                constraints.emplace_back(initial3D.size()-1, initial3D.back());
-                
-                for(const auto& existing : curves) {
-                    Point2d intersect;
-                    if(segmentIntersection(existing.p0, existing.p1, p0, p1, intersect)) {
-                        // Find closest point on new curve
-                        int closestIdx = 0;
-                        double minDist = numeric_limits<double>::max();
-                        for(size_t i = 0; i < newCurve.sampledLine.size(); ++i) {
-                            double d = norm(newCurve.sampledLine[i] - intersect);
-                            if(d < minDist) {
-                                minDist = d;
-                                closestIdx = i;
-                            }
-                        }
-                        
-                        // Add constraint using existing curve's z-distance
-                        constraints.emplace_back(closestIdx,
-                            Point3d(intersect.x, intersect.y, existing.zDistances[closestIdx]));
-                    }
-                }
-                
-                // Apply ARAP deformation if needed
-                if(constraints.size() > 2) {
-                    newCurve.deformedCurve3D = deformARAP(initial3D, constraints);
-                } else {
-                    newCurve.deformedCurve3D = initial3D;
-                }
-                
-                curves.push_back(newCurve);
-                exportToOBJ(curves, "output.obj");
-                
-                // Reset for next curve
+// ---------------------------
+// Keyboard Callback
+// ---------------------------
+void keyCallback(int key) {
+    if (key == 's' || key == 'S') {
+        if (currentState == WAIT_STROKE) {
+            cout << "Start drawing the stroke..." << endl;
+            currentStroke.clear();
+            currentState = DRAW_STROKE;
+        }
+    }
+    else if (key == 13) { // Enter key to finish stroke
+        if (currentState == DRAW_STROKE) {
+            if (currentStroke.size() < 2) {
+                cout << "Not enough points drawn. Resetting." << endl;
                 currentState = SET_P0;
-                currentStroke.clear();
-                redraw();
+                return;
             }
-            break;
-    }
-    
-    // Redraw
-    Mat display(480, 640, CV_8UC3, Scalar(255,255,255));
-    
-    // Draw existing curves
-    for(const auto& curve : curves) {
-        // Draw base line
-        line(display, cv2gl(curve.p0), cv2gl(curve.p1), Scalar(255,0,0));
-        
-        // Draw deformed 3D curve projection
-        vector<Point2d> projPoints;
-        for(const auto& p : curve.deformedCurve3D) {
-            projPoints.push_back(cv2gl(Point2d(p.x, p.y)));
+
+            // Sample the segment with the same number of points as the stroke
+            sampledLine = sampleLine2D(p0, p1, currentStroke.size());
+            sampledLines.push_back(sampledLine);
+
+            // Compute distances
+            currentzDistances.clear();
+            for (size_t i = 0; i < sampledLine.size(); i++) {
+                currentzDistances.push_back(distance2D(sampledLine[i], currentStroke[i]));
+            }
+            allzDistances.push_back(currentzDistances);
+            cout << "Stroke finished. Press 'I' to check intersections." << endl;
+            currentState = SET_P0;
         }
-        polylines(display, projPoints, false, Scalar(0,255,255));
     }
-    
-    // Draw current state
-    if(currentState == SET_P1) {
-        circle(display, Point(x,y), 3, Scalar(0,0,255), -1);
-    }
-    else if(currentState == DRAW_STROKE) {
-        // Draw sampled line
-        vector<Point2d> glPoints;
-        for(const auto& p : sampleLine(p0, p1, currentStroke.size())) {
-            glPoints.push_back(cv2gl(p));
+    else if (key == 'i' || key == 'I') { // Check intersection
+        if (sampledLines.size() < 2) {
+            cout << "Not enough sampled lines to check intersections." << endl;
+            return;
         }
-        polylines(display, glPoints, false, Scalar(255,0,0));
-        
-        // Draw stroke
-        vector<Point> cvPoints;
-        for(const auto& p : currentStroke) {
-            cvPoints.push_back(cv2gl(p));
-        }
-        polylines(display, cvPoints, false, Scalar(0,255,0), 1, LINE_AA);
-        
-        // Draw connectors
-        if(currentStroke.size() == sampleLine(p0, p1, currentStroke.size()).size()) {
-            auto sampled = sampleLine(p0, p1, currentStroke.size());
-            for(size_t i = 0; i < sampled.size(); ++i) {
-                line(display, cv2gl(sampled[i]), cv2gl(currentStroke[i]),
-                    Scalar(0,0,255));
+
+        intersections.clear();
+
+        // Check for intersections between the first and second sampled line segments
+        const auto& line1 = sampledLines[0];
+        const auto& line2 = sampledLines[1];
+
+        for (size_t i = 1; i < line1.size(); i++) {
+            Point2d segA_start = line1[i - 1];
+            Point2d segA_end = line1[i];
+
+            for (size_t j = 1; j < line2.size(); j++) {
+                Point2d segB_start = line2[j - 1];
+                Point2d segB_end = line2[j];
+
+                Point2d intersection;
+                if (lineSegmentIntersection(segA_start, segA_end, segB_start, segB_end, intersection)) {
+                    intersections.push_back(intersection);
+                    cout << "Intersection at: " << intersection << endl;
+                    intersectionPair.first = i;
+                    intersectionPair.second = j;
+                }
             }
         }
+
+        cout << "Total intersections found: " << intersections.size() << endl;
+        redraw();
     }
-    
-    imshow("Curve Deformation", display);
+
+    else if (key == 'o' || key == 'O') { // Export 3D curves as OBJ
+        if (sampledLines.size() < 2) {
+            cout << "Not enough sampled lines to create 3D curves." << endl;
+            return;
+        }
+
+        // Create 3D curve by using z-coordinates from the sampled lines
+        vector<Point3d> firstcurve; vector<Point3d> firstcurvewithz;
+        vector<Point3d> secondcurve; vector<Point3d> secondcurvewithz;
+        vector<Point3d> testcurve;
+        const auto& line1 = sampledLines[0];
+        const auto& line2 = sampledLines[1];
+
+        for (size_t i = 0; i < line1.size(); ++i) {
+            double z = 0;
+            if(i<allzDistances[0].size())
+                z = allzDistances[0][i];
+            // if(i==intersectionPair.second)
+            //     z = allzDistances[0][intersectionPair.first];
+            firstcurve.push_back(Point3d(line1[i].x, line1[i].y, 0.0));  // Add the 3D point
+            firstcurvewithz.push_back(Point3d(line1[i].x, line1[i].y, z));  // Add the 3D point
+        }
+
+        for (size_t i = 0; i < line2.size(); ++i) {
+            double z = 0;
+            if(i<allzDistances[1].size())
+                z = allzDistances[1][i];
+            if(i==intersectionPair.second)
+                testcurve.push_back(Point3d(line2[i].x, line2[i].y, allzDistances[0][intersectionPair.first]));  // Add the 3D point
+            else
+                testcurve.push_back(Point3d(line2[i].x, line2[i].y, z));  // Add the 3D point
+            //     z = allzDistances[0][intersectionPair.first];
+
+            secondcurve.push_back(Point3d(line2[i].x, line2[i].y, 0.0));  // Add the 3D point
+            secondcurvewithz.push_back(Point3d(line2[i].x, line2[i].y, z));  // Add the 3D point
+        }
+
+        std::vector<int> constraints;
+        constraints.push_back(0);
+        constraints.push_back(secondcurvewithz.size()-1);
+        constraints.push_back(intersectionPair.second);
+
+        vector<Point3d>target;
+        target.push_back(secondcurvewithz[0]);
+        target.push_back(secondcurvewithz[secondcurvewithz.size()-1]);
+        target.push_back(Point3d(line2[intersectionPair.second].x, line2[intersectionPair.second].y,allzDistances[0][intersectionPair.first]));
+
+
+        vector<Point3d> deformed_3DCurve = matToVector(deformCurveARAP(vectorToMat(secondcurvewithz), vectorToMat(secondcurvewithz), constraints, vectorToMat(target)));
+
+        // Export to OBJ file
+        exportToOBJ(firstcurve, "Firstcurve.obj");
+        exportToOBJ(firstcurvewithz, "Firstcurvewithz.obj");
+        exportToOBJ(secondcurve, "secondcurve.obj");
+        exportToOBJ(secondcurvewithz, "secondcurvewithz.obj");
+        exportToOBJ(testcurve, "testcurve.obj");
+        exportToOBJ(deformed_3DCurve, "deformedSecosndcurve.obj");
+        cout << "obj generated" << endl;
+
+        redraw();
+    }
+
 }
 
+// ---------------------------
+// Main Function
+// ---------------------------
 int main() {
     namedWindow("Curve Deformation", WINDOW_AUTOSIZE);
-        setMouseCallback("Curve Deformation", mouseCallback);
-        
-        Mat display(480, 640, CV_8UC3, Scalar(255,255,255));
-        imshow("Curve Deformation", display);
-        
-        while(waitKey(1) != 27) {} // ESC to exit
-        
-        return 0;
+    setMouseCallback("Curve Deformation", mouseCallback);
+
+    Mat display(480, 640, CV_8UC3, Scalar(255,255,255));
+    imshow("Curve Deformation", display);
+
+    cout << "Instructions:\n"
+         << "1. Click to set the first endpoint (p0).\n"
+         << "2. Click to set the second endpoint (p1).\n"
+         << "3. Press 'S' to start drawing the stroke.\n"
+         << "4. Drag the mouse while holding left-click to draw.\n"
+         << "5. Press 'Enter' to finish the stroke (red lines appear).\n"
+         << "Press ESC to exit.\n";
+
+    while (true) {
+        int key = waitKey(1);
+        if (key == 27) break; // ESC to exit
+        keyCallback(key);
+    }
+
+    return 0;
 }

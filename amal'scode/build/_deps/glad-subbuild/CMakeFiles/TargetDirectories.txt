@@ -1,0 +1,3 @@
+/Users/gowtham/Desktop/Projects/amal-arap-poyline copy/amal'scode/build/_deps/glad-subbuild/CMakeFiles/glad-populate.dir
+/Users/gowtham/Desktop/Projects/amal-arap-poyline copy/amal'scode/build/_deps/glad-subbuild/CMakeFiles/edit_cache.dir
+/Users/gowtham/Desktop/Projects/amal-arap-poyline copy/amal'scode/build/_deps/glad-subbuild/CMakeFiles/rebuild_cache.dir
